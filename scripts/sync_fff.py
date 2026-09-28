@@ -1,17 +1,24 @@
 #!/usr/bin/env python3
 """
-Sync classement FFF → Firebase.
-Version diagnostic : dump du HTML pour identifier la structure exacte.
+Sync classement FFF → Firebase via API DOFA officielle.
+URL: https://api-dofa.fff.fr/api/compets/457713/phases/1/poules/2/classement_journees
 """
-import json, os, sys, time
+import json, os, sys
+import requests
 import firebase_admin
 from firebase_admin import credentials, firestore
-from playwright.sync_api import sync_playwright, TimeoutError as PlaywrightTimeout
 
-# URL exacte fournie
-FFF_URL       = "https://seineetmarne.fff.fr/recherche-clubs?subtab=ranking&tab=resultats&scl=116693&competition=457713&stage=1&group=2&label=U14%20D2"
+API_URL       = "https://api-dofa.fff.fr/api/compets/457713/phases/1/poules/2/classement_journees"
 CLUB_NAME_FFF = "OZOIR FC 77"
 FIREBASE_DOC  = ("kickoff", "appState")
+
+HEADERS = {
+    "User-Agent":      "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+    "Accept":          "application/json, text/plain, */*",
+    "Accept-Language": "fr-FR,fr;q=0.9",
+    "Referer":         "https://seineetmarne.fff.fr/",
+    "Origin":          "https://seineetmarne.fff.fr",
+}
 
 def init_firebase():
     cred_json = os.environ.get("FIREBASE_SERVICE_ACCOUNT")
@@ -21,115 +28,89 @@ def init_firebase():
     firebase_admin.initialize_app(cred)
     return firestore.client()
 
-def scrape():
-    with sync_playwright() as p:
-        browser = p.chromium.launch(headless=True, args=[
-            "--no-sandbox", "--disable-setuid-sandbox", "--disable-dev-shm-usage",
-        ])
-        ctx = browser.new_context(
-            user_agent="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
-            locale="fr-FR",
-            viewport={"width": 1280, "height": 900},
-        )
-        page = ctx.new_page()
+def fetch_standings():
+    print(f"  GET {API_URL}")
+    r = requests.get(API_URL, headers=HEADERS, timeout=15)
+    print(f"  → {r.status_code}")
+    r.raise_for_status()
+    data = r.json()
+    print(f"  JSON keys: {list(data.keys()) if isinstance(data, dict) else type(data)}")
+    print(f"  Sample: {str(data)[:400]}")
+    return data
 
-        # Intercepter les appels API XHR/fetch pour trouver l'endpoint JSON
-        api_responses = []
-        def handle_response(response):
-            if "fff.fr" in response.url and response.status == 200:
-                ct = response.headers.get("content-type", "")
-                if "json" in ct:
-                    try:
-                        data = response.json()
-                        print(f"  🔗 API JSON: {response.url}")
-                        print(f"     → {str(data)[:300]}")
-                        api_responses.append({"url": response.url, "data": data})
-                    except:
-                        pass
-        page.on("response", handle_response)
+def parse_standings(data):
+    standings = []
+    # Chercher la liste des clubs dans la structure
+    rows = None
+    if isinstance(data, list):
+        rows = data
+    elif isinstance(data, dict):
+        # Parcourir toutes les clés pour trouver une liste
+        for key, val in data.items():
+            print(f"  Clé '{key}': {type(val).__name__} — {str(val)[:100]}")
+            if isinstance(val, list) and len(val) > 0:
+                rows = val
+                print(f"  → Utilisation de '{key}' ({len(val)} éléments)")
+                break
 
-        print(f"  📖 Chargement...")
-        page.goto(FFF_URL, wait_until="domcontentloaded", timeout=30000)
-
-        # Attendre 8 secondes que Vue.js rende le contenu
-        print("  ⏳ Attente rendu Vue.js (8s)...")
-        time.sleep(8)
-
-        html = page.content()
-        print(f"  📄 HTML après attente: {len(html)} chars")
-
-        # Chercher OZOIR dans le HTML
-        if "OZOIR" in html.upper():
-            print("  ✅ 'OZOIR' trouvé dans le HTML !")
-            # Extraire la zone autour
-            idx = html.upper().index("OZOIR")
-            print(f"  Contexte: ...{html[max(0,idx-200):idx+300]}...")
-        else:
-            print("  ❌ 'OZOIR' PAS trouvé dans le HTML")
-
-        # Lister tous les éléments <table> et <tr>
-        tables = page.locator("table").count()
-        trs    = page.locator("tr").count()
-        print(f"  Tables: {tables}, Lignes TR: {trs}")
-
-        # Chercher des classes communes de classement
-        for cls in ["ranking", "classement", "standings", "group-standing", "poule"]:
-            els = page.locator(f"[class*='{cls}']").count()
-            if els:
-                print(f"  Classe '{cls}': {els} éléments")
-
-        # Dump premiers 5000 chars du body
-        print("\n  === HTML BODY (5000 chars) ===")
-        body = page.locator("body").inner_html()
-        print(body[:5000])
-        print("  === FIN HTML ===\n")
-
-        browser.close()
-
-        # Si des API JSON ont été interceptées, utiliser ces données
-        if api_responses:
-            print(f"  🎯 {len(api_responses)} appels API interceptés - utilisation des données JSON")
-            return parse_api_data(api_responses)
-
+    if not rows:
         return []
 
-def parse_api_data(responses):
-    """Parse les réponses API pour extraire le classement."""
-    for resp in responses:
-        data = resp["data"]
-        # Chercher une liste avec des infos de clubs
-        rows = None
-        if isinstance(data, list) and len(data) > 3:
-            rows = data
-        elif isinstance(data, dict):
-            for key in ["ranking", "classement", "standings", "data", "results", "groups", "teams"]:
-                if key in data and isinstance(data[key], list):
-                    rows = data[key]
-                    break
-        if rows:
-            standings = []
-            for i, row in enumerate(rows):
-                name = (row.get("clubName") or row.get("name") or row.get("club") or
-                        row.get("team") or row.get("nom") or row.get("libelle") or "").strip()
-                pts  = int(row.get("points") or row.get("pts") or row.get("point") or 0)
-                j    = int(row.get("played") or row.get("joues") or row.get("j") or row.get("matchsJoues") or 0)
+    for i, row in enumerate(rows):
+        if not isinstance(row, dict):
+            continue
+        print(f"  Row {i}: {row}")
+        # Chercher nom du club
+        name = ""
+        for k in ["clubName", "name", "club", "equipe", "team", "nom",
+                  "libelle", "shortName", "longName", "teamName"]:
+            if k in row and row[k]:
+                name = str(row[k]).strip()
+                break
+        # Si pas trouvé, chercher dans les sous-objets
+        if not name:
+            for k, v in row.items():
+                if isinstance(v, dict):
+                    for k2 in ["name", "nom", "libelle", "shortName"]:
+                        if k2 in v and v[k2]:
+                            name = str(v[k2]).strip()
+                            break
                 if name:
-                    standings.append({
-                        "pos":  i + 1,
-                        "club": name,
-                        "pts":  pts,
-                        "j":    j,
-                        "mine": CLUB_NAME_FFF.lower() in name.lower(),
-                    })
-            if standings:
-                return standings
-    return []
+                    break
+
+        # Points
+        pts = 0
+        for k in ["points", "pts", "point", "totalPoints", "nbPoints", "nb_points"]:
+            if k in row:
+                try: pts = int(row[k]); break
+                except: pass
+
+        # Matchs joués
+        j = 0
+        for k in ["played", "joues", "j", "matchsJoues", "gamesPlayed", "nb_matchs", "nbMatchs"]:
+            if k in row:
+                try: j = int(row[k]); break
+                except: pass
+
+        if name:
+            standings.append({
+                "pos":  i + 1,
+                "club": name,
+                "pts":  pts,
+                "j":    j,
+                "mine": CLUB_NAME_FFF.lower() in name.lower(),
+            })
+
+    return standings
 
 def main():
-    print("🔄 Sync FFF → Firebase (diagnostic)")
+    print("🔄 Sync FFF → Firebase (API DOFA)")
     db = init_firebase()
-    standings = scrape()
-    print(f"\n  Résultat: {len(standings)} équipes")
+
+    data = fetch_standings()
+    standings = parse_standings(data)
+
+    print(f"\n  ✅ {len(standings)} équipes parsées")
     if standings:
         for s in standings:
             print(f"    {s['pos']}. {s['club']} — {s['pts']} pts {'⭐' if s['mine'] else ''}")
@@ -138,7 +119,7 @@ def main():
         )
         print("  ✅ Firebase mis à jour")
     else:
-        print("  ⚠️ Aucune donnée")
+        print("  ⚠️ Aucune équipe parsée — vérifier la structure JSON ci-dessus")
 
 if __name__ == "__main__":
     main()
