@@ -2,7 +2,7 @@ name: Sync FFF → Firebase
 
 on:
   schedule:
-    - cron: '0 */2 * * *'  # Toutes les 2h
+    - cron: '0 */2 * * *'
   workflow_dispatch:
 
 jobs:
@@ -16,7 +16,10 @@ jobs:
           python-version: '3.12'
 
       - name: Install dependencies
-        run: pip install requests beautifulsoup4 firebase-admin lxml
+        run: |
+          pip install playwright beautifulsoup4 firebase-admin lxml
+          playwright install chromium
+          playwright install-deps chromium
 
       - name: Run sync
         env:
