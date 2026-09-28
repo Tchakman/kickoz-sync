@@ -10,17 +10,10 @@ jobs:
     runs-on: ubuntu-24.04
     steps:
       - uses: actions/checkout@v4
-
       - uses: actions/setup-python@v5
         with:
           python-version: '3.12'
-
-      - name: Install dependencies
-        run: |
-          pip install playwright beautifulsoup4 firebase-admin lxml
-          playwright install chromium
-          playwright install-deps chromium
-
+      - run: pip install requests firebase-admin
       - name: Run sync
         env:
           FIREBASE_SERVICE_ACCOUNT: ${{ secrets.FIREBASE_SERVICE_ACCOUNT }}
