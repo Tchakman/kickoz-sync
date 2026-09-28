@@ -1,139 +1,101 @@
 #!/usr/bin/env python3
 """
-Sync classement FFF → Firebase Firestore via l'API interne FFF.
+Sync classement FFF → Firebase via Playwright (vrai navigateur).
 """
-
-import json, os, sys, time
-import requests
+import json, os, sys, re, time
+from datetime import datetime
+from playwright.sync_api import sync_playwright
 import firebase_admin
 from firebase_admin import credentials, firestore
 
 # ── Config ─────────────────────────────────────────────────────────────
-COMPETITION_ID = "457713"
-POULE_ID       = "2"          # groupe/poule B
-CLUB_NAME_FFF  = "OZOIR FC 77"
-FIREBASE_DOC   = ("kickoff", "appState")
+FFF_URL       = "https://seineetmarne.fff.fr/recherche-clubs?scl=116693&tab=resultats&subtab=ranking&competition=457713&stage=1&group=2&label=U14%20D2"
+CLUB_NAME_FFF = "OZOIR FC 77"
+FIREBASE_DOC  = ("kickoff", "appState")
 
-# L'API interne que le site FFF utilise en JSON
-STANDINGS_URL = f"https://seineetmarne.fff.fr/api/competition/{COMPETITION_ID}/ranking?group={POULE_ID}"
-CALENDAR_URL  = f"https://seineetmarne.fff.fr/api/competition/{COMPETITION_ID}/calendar?group={POULE_ID}"
-
-HEADERS = {
-    "User-Agent":      "Mozilla/5.0 (iPhone; CPU iPhone OS 17_0 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.0 Mobile/15E148 Safari/604.1",
-    "Accept":          "application/json, text/plain, */*",
-    "Accept-Language": "fr-FR,fr;q=0.9",
-    "Referer":         "https://seineetmarne.fff.fr/",
-    "Origin":          "https://seineetmarne.fff.fr",
-}
-
-MOIS = {"janvier":1,"février":2,"mars":3,"avril":4,"mai":5,"juin":6,
-        "juillet":7,"août":8,"septembre":9,"octobre":10,"novembre":11,"décembre":12}
-
-# ── Init Firebase ───────────────────────────────────────────────────────
+# ── Firebase ────────────────────────────────────────────────────────────
 def init_firebase():
     cred_json = os.environ.get("FIREBASE_SERVICE_ACCOUNT")
     if not cred_json:
-        print("❌ FIREBASE_SERVICE_ACCOUNT manquant")
-        sys.exit(1)
+        print("❌ FIREBASE_SERVICE_ACCOUNT manquant"); sys.exit(1)
     cred = credentials.Certificate(json.loads(cred_json))
     firebase_admin.initialize_app(cred)
     return firestore.client()
 
-# ── Fetch avec retry ────────────────────────────────────────────────────
-def fetch(url, params=None):
-    for attempt in range(3):
-        try:
-            time.sleep(2 + attempt * 3)
-            r = requests.get(url, headers=HEADERS, params=params, timeout=20)
-            print(f"  GET {url} → {r.status_code}")
-            if r.status_code == 200:
-                return r
-            if r.status_code == 403:
-                print(f"  ⚠️ 403 tentative {attempt+1}/3")
-        except Exception as e:
-            print(f"  ⚠️ Erreur réseau: {e}")
-    return None
+# ── Scrape avec Playwright ──────────────────────────────────────────────
+def scrape_with_playwright():
+    standings = []
+    with sync_playwright() as p:
+        browser = p.chromium.launch(headless=True)
+        page = browser.new_page()
+        page.set_extra_http_headers({
+            "Accept-Language": "fr-FR,fr;q=0.9",
+            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
+        })
+        print(f"  📖 Chargement de la page FFF...")
+        page.goto(FFF_URL, wait_until="networkidle", timeout=30000)
+        time.sleep(3)
 
-# ── Parse classement ────────────────────────────────────────────────────
-def get_standings():
-    r = fetch(STANDINGS_URL)
-    if not r:
-        return try_scrape_standings()
-    try:
-        data = r.json()
-        print(f"  API response keys: {list(data.keys()) if isinstance(data, dict) else f'list of {len(data)}'}")
-        print(f"  First item sample: {str(data[0] if isinstance(data,list) else list(data.items())[:3])[:200]}")
-        rows = data if isinstance(data, list) else data.get("ranking", data.get("classement", data.get("data", [])))
-        standings = []
-        for i, row in enumerate(rows):
-            name = (row.get("name") or row.get("club") or row.get("team") or row.get("nom") or "").strip()
-            pts  = int(row.get("points") or row.get("pts") or 0)
-            j    = int(row.get("played") or row.get("joues") or row.get("j") or 0)
-            standings.append({
-                "pos":  i + 1,
-                "club": name,
-                "pts":  pts,
-                "j":    j,
-                "mine": CLUB_NAME_FFF.lower() in name.lower(),
-            })
-        print(f"  ✅ {len(standings)} équipes (API JSON)")
-        return standings
-    except Exception as e:
-        print(f"  ⚠️ JSON parse error: {e}")
-        return try_scrape_standings()
+        # Chercher la table classement
+        html = page.content()
+        print(f"  📄 Page chargée ({len(html)} chars)")
 
-# ── Scrape HTML fallback classement ─────────────────────────────────────
-def try_scrape_standings():
-    from bs4 import BeautifulSoup
-    page_url = f"https://seineetmarne.fff.fr/recherche-clubs?scl=116693&tab=resultats&subtab=ranking&competition={COMPETITION_ID}&stage=1&group={POULE_ID}"
-    headers_html = {**HEADERS, "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8"}
-    try:
-        time.sleep(5)
-        r = requests.get(page_url, headers=headers_html, timeout=30)
-        if r.status_code != 200:
-            print(f"  ❌ HTML fallback aussi bloqué ({r.status_code})")
-            return []
-        soup = BeautifulSoup(r.text, "lxml")
-        # Chercher la table avec colonnes Points
+        from bs4 import BeautifulSoup
+        soup = BeautifulSoup(html, "lxml")
+
+        # Chercher toutes les tables
         for table in soup.find_all("table"):
-            headers = [th.get_text(strip=True).upper() for th in table.find_all("th")]
-            if "PTS" in headers or "POINTS" in headers:
-                standings = []
-                for i, row in enumerate(table.find("tbody").find_all("tr") if table.find("tbody") else table.find_all("tr")[1:]):
+            ths = [th.get_text(strip=True).upper() for th in table.find_all("th")]
+            print(f"  Table headers: {ths[:6]}")
+            if any(h in ths for h in ["PTS", "POINTS", "PT"]):
+                tbody = table.find("tbody")
+                rows  = tbody.find_all("tr") if tbody else table.find_all("tr")[1:]
+                for i, row in enumerate(rows):
                     cols = [td.get_text(strip=True) for td in row.find_all("td")]
                     if len(cols) < 3: continue
-                    name = cols[1] if len(cols) > 2 else cols[0]
-                    pts  = next((int(c) for c in reversed(cols) if c.isdigit()), 0)
-                    standings.append({"pos":i+1,"club":name.strip(),"pts":pts,"j":0,"mine":CLUB_NAME_FFF.lower() in name.lower()})
-                print(f"  ✅ {len(standings)} équipes (HTML fallback)")
-                return standings
-        print("  ⚠️ Table classement non trouvée dans le HTML")
-        return []
-    except Exception as e:
-        print(f"  ❌ Scrape HTML error: {e}")
-        return []
+                    print(f"    Row {i}: {cols[:6]}")
+                    # Trouver le nom et les points
+                    name = ""
+                    pts  = 0
+                    j    = 0
+                    for c in cols:
+                        if any(x in c.upper() for x in ["FC", "US ", "AS ", "SC ", "OZOIR", "SENART", "PONTAULT", "CLAYE", "LOGNES", "GRETZ", "TORCY", "BRIARD", "VAL D", "ENT."]):
+                            name = c
+                        if c.isdigit():
+                            if not j: j = int(c)
+                            pts = int(c)  # dernier nombre = pts
+                    if not name and len(cols) > 1:
+                        name = cols[1]
+                    standings.append({
+                        "pos":  i + 1,
+                        "club": name.strip(),
+                        "pts":  pts,
+                        "j":    j,
+                        "mine": CLUB_NAME_FFF.lower() in name.lower(),
+                    })
+                break
+
+        browser.close()
+    return standings
 
 # ── Main ────────────────────────────────────────────────────────────────
 def main():
-    print("🔄 Sync FFF → Firebase")
+    print("🔄 Sync FFF → Firebase (Playwright)")
     db = init_firebase()
-    
-    standings = get_standings()
-    
-    doc_ref = db.collection(FIREBASE_DOC[0]).document(FIREBASE_DOC[1])
-    update  = {}
-    
+
+    standings = scrape_with_playwright()
+    print(f"  ✅ {len(standings)} équipes trouvées")
+
     if standings:
-        update["standings"] = standings
         our = next((s for s in standings if s["mine"]), None)
         if our:
             print(f"  🏆 {CLUB_NAME_FFF} : {our['pos']}e — {our['pts']} pts")
-    
-    if update:
-        doc_ref.set(update, merge=True)
+        db.collection(FIREBASE_DOC[0]).document(FIREBASE_DOC[1]).set(
+            {"standings": standings}, merge=True
+        )
         print("  ✅ Firebase mis à jour")
     else:
-        print("  ℹ️ Aucune donnée récupérée — Firebase inchangé")
+        print("  ⚠️ Aucune donnée — Firebase inchangé")
 
 if __name__ == "__main__":
     main()
